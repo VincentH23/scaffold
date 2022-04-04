@@ -98,6 +98,13 @@ class PPO:
             #### data generate by old policy
                 old_actions, old_states, advantages, old_logprobs, discounted_return, action_dict  = batch
 
+                old_actions = old_actions.to(self.device)
+                old_states = old_states.to(self.device)
+                advantages = advantages.to(self.device)
+                old_logprobs = old_logprobs.to(self.device)
+                discounted_return = discounted_return.to(self.device)
+
+
                 # Evaluating old actions and values
                 logprobs, state_values, dist_entropy = self.policy.evaluate(old_states, old_actions, mask= False)
 

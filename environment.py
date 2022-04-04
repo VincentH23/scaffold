@@ -3,7 +3,9 @@ import copy
 import torch
 from rdkit.Chem import AllChem
 from rdkit import Chem, DataStructs
-from MARS.common.chem import break_bond_mol, add_arm, check_validity, mol_to_dgl, draw_mol, find_common_scaffold
+
+import actor
+from MARS.common.chem import break_bond_mol, add_arm, check_validity, mol_to_dgl, draw_mol
 from MARS.datasets.utils import load_vocab
 from MARS.common.utils import sample_idx
 import numpy as np
@@ -46,7 +48,6 @@ class Environement:
 
         self.nb_episode = 0
         self.threshold_nov = 0.4
-        ##TODO change value of threshold
         self.threshold_div = 0.3
         self.thresholf_mydiv = 0.5
         self.max_step = 10
@@ -61,17 +62,7 @@ class Environement:
         self.nb_call_reward = 0
 
 
-        with open('scaffold.txt','r') as f:
-            smiles = f.readlines()
-        smiles = [line.split()[0] for line in smiles]
-        scaffold = [Chem.MolFromSmiles(smi) for smi in smiles if Chem.MolFromSmiles(smi)]
-        self.scaffold_mol_dict = {
-            'mols' : scaffold,
-            'smiles' : smiles,
-            'UCB' : list(np.zeros(len(scaffold))),
-            'R' : list(np.zeros(len(scaffold))),
-            'N' : list(np.zeros(len(scaffold)))
-        }
+
 
         self.previous_score = None
 
@@ -83,8 +74,16 @@ class Environement:
             'global_act' : []
         })
 
+
+
+
+        self.max_queue_size = 100
+
+        m = Chem.MolFromSmiles('CC')
+        reward = self.compute_reward(m, False)[0]
+        self.queue = {'mols': self.max_queue_size*[m], 'rewards': self.max_queue_size*[reward]}
+
         self.MaxImittationSetSize = 50000
-        self.index_scaffold = None
 
 
     def reset(self):
@@ -92,7 +91,7 @@ class Environement:
         self.step = 0
         self.current_mol = None
         self.current_graph = None
-        self.index_scaffold = None
+
         if self.new :
             self.current_mol, self.current_graph = self.init_mol()
             self.new = False
@@ -105,17 +104,24 @@ class Environement:
         """
         return init molecule
         """
-        R = np.array(self.scaffold_mol_dict['R'])
-        N = np.array(self.scaffold_mol_dict['N'])
-
-        ##TODO change the way to init the molecule
-        prob =  1 + (1+R)/(N+1e-6)
+        prob = list(np.exp(np.array(self.queue['rewards']))/np.sum(np.exp(np.array(self.queue['rewards']))))
         idx_init_mol = sample_idx(prob)
-        init_mol = self.scaffold_mol_dict['mols'][idx_init_mol]
+        init_mol = self.queue['mols'][idx_init_mol]
         init_graph = mol_to_dgl(init_mol)
-        self.index_scaffold = idx_init_mol
         self.previous_score,_,_ = self.compute_reward(init_mol, True)
         return init_mol, init_graph
+
+    def update_queue(self, mol, reward):
+        prob = list(np.exp(np.array(self.queue['rewards'])) / np.sum(np.exp(np.array(self.queue['rewards']))))
+        index_mol_to_replace = sample_idx(prob)
+        mol_in_queue_reward = self.queue['rewards'][index_mol_to_replace]
+        threshold = (reward- mol_in_queue_reward)/(max((max(reward, mol_in_queue_reward)),1e-6))
+        normalized_threshold = (threshold+1)*0.5
+        if random.random()< normalized_threshold:
+            self.queue['mols'][index_mol_to_replace] = mol
+            self.queue['rewards'][index_mol_to_replace] = reward
+
+
 
 
     def edit(self, graph, mol, action, del_idx, add_idx, arm_idx):
@@ -165,7 +171,7 @@ class Environement:
     def next_step(self, action):
         """
 
-        :param action: dict 'act', 'del', 'add', 'arm'
+        :param action: dict 'act', 'del', 'add', 'arm', 'global_act
         :return: state (new_mol), reward, done(if no add to new_mols)
         """
 
@@ -174,7 +180,7 @@ class Environement:
         del_idx = action['del']
         add_idx = action['add']
         arm_idx = action['arm']
-        global_action = action['global_act']
+
 
         ###make a copy of graph and molecule
         mol = copy.deepcopy(self.current_mol)
@@ -182,22 +188,21 @@ class Environement:
 
         ###edition of molecule
         new_mol, not_changed = self.edit(graph, mol, action=act, del_idx=del_idx, add_idx=add_idx, arm_idx=arm_idx)
-        if not_changed == False:
-            self.current_mol = new_mol
-            self.current_graph = mol_to_dgl(new_mol)
-
 
         ###compute reward
         reward, CP, CND = self.compute_reward(new_mol, not_changed)
 
+        if not_changed == False:
+            self.current_mol = new_mol
+            self.current_graph = mol_to_dgl(new_mol)
+            self.update_queue(new_mol, reward)
 
 
         ##### save molecule according its chemical property
         if CP and CND:
             self.new_mol_dict['mols'].append(new_mol)
             self.new_mol_dict['fps'].append(AllChem.GetMorganFingerprintAsBitVect(new_mol, 3, 2048))
-            self.update_scaffold(new_mol)
-            self.scaffold_mol_dict['R'][self.index_scaffold] += 1
+
 
 
 
@@ -227,13 +232,7 @@ class Environement:
             self.imitation_dataset = data.Subset(self.imitation_dataset, indices)
             self.imitation_dataset = ImitationDataset.reconstruct(self.imitation_dataset)
 
-    def update_scaffold(self, mol):
-        for m in self.ref_mol_dict['mols'] + self.new_mol_dict['mols']:
-            scaffold = find_common_scaffold(mol, m)
-            if scaffold is not None:
-                self.scaffold_mol_dict['R'].append(0)
-                self.scaffold_mol_dict['N'].append(0)
-                self.scaffold_mol_dict['mols'].append(scaffold)
+
 
     def compute_reward(self, new_mol, not_change):
         """
@@ -253,7 +252,7 @@ class Environement:
         CND = C_div*C_novelty
         CP = int(gsk3b_score>=0.5) * int(jnk3_score>=0.5) * int(qed_score>=0.6) * int(sa_score>=0.67)
 
-        prop_reward = gsk3b_score* jnk3_score * qed_score* sa_score /4
+        prop_reward = min(gsk3b_score, 0.6)* min(jnk3_score,0.6) * min(qed_score,0.7)* min(sa_score,0.7) /4
         nov_reward = 1 - max(sim_with_ref) if max(sim_with_ref) >= self.threshold_nov + 0.1 else 1 - (self.threshold_nov) + 0.1
         # div_reward = 1 - max(sim_with_proposal) if max(sim_with_proposal) >= self.threshold_nov + 0.1 else 1 - (self.threshold_nov) + 0.1
         div_reward = 1 - max(sim_with_proposal)
@@ -276,9 +275,83 @@ class Environement:
 
 
 
-
+#
+#
+# if __name__ == '__main__':
+#
+#     mol = Chem.MolFromSmiles('NC(=O)c1ccccc1Nc1ccnc(Oc2ccccc2)c1')
+#     graph = mol_to_dgl(mol)
+#
+#
+#     env = Environement()
+#
+#     env.current_graph = graph
+#     env.current_mol = mol
+#     for i in range(50):
+#         print(i)
+#         add_avalaible_atom = torch.nonzero(env.current_graph.ndata['n_feat'][:, -1], as_tuple=True)[0]
+#         del_avalaible_bond = torch.nonzero(env.current_graph.edata['e_feat'].argmax(dim=-1) == 0, as_tuple=True)[0]
+#
+#         action_prob = [int(del_avalaible_bond.shape[0] > 0), int(add_avalaible_atom.shape[0] > 0)]
+#         if sum(action_prob)==0 :
+#             break
+#         action = sample_idx(action_prob)
+#         if action ==0 :
+#
+#             del_idx = del_avalaible_bond.tolist()[sample_idx(len(del_avalaible_bond.tolist())*[1])]
+#             arm_idx = None
+#             add_idx = None
+#             print('check bond type')
+#             # for index in del_avalaible_bond :
+#             #     u = env.current_graph.all_edges()[0][index].item()
+#             #     v = env.current_graph.all_edges()[1][index].item()
+#             #     print(env.current_mol.GetBondBetweenAtoms(u,v).GetBondType())
+#         elif action==1 :
+#             arm_idx = sample_idx([i for i in range(1000)])
+#             add_idx = add_avalaible_atom.tolist()[sample_idx(len(add_avalaible_atom.tolist())*[1])]
+#             del_idx = None
+#
+#         action_dict = {
+#             'act' : action,
+#             'del' : del_idx,
+#             'arm' : arm_idx,
+#             'add' : add_idx
+#         }
+#         _, not_changed = env.next_step(action_dict)
+#
+#         print('not changed ', not_changed)
+#         if not_changed :
+#             print(action_dict)
+#             print('nb atoms', len(env.current_mol.GetAtoms()))
+#             # if action == 0 :
+#             #     u = env.current_graph.all_edges()[0][del_idx].item()
+#             #     v = env.current_graph.all_edges()[1][del_idx].item()
+#             #     type_bond = str(env.current_mol.GetBondBetweenAtoms(u,v).GetBondType())
+#             #     path = 'mols/'+type_bond +'_mol_del_{}_{}.jpg'.format(u,v)
+#             #     draw_mol(env.current_mol,path)
+#             #     print(path)
+#             #     print(action_prob)
+#             #     print(del_idx)
+#             #     print(del_avalaible_bond)
+#             #     for index in del_avalaible_bond:
+#             #         u = env.current_graph.all_edges()[0][index].item()
+#             #         v = env.current_graph.all_edges()[1][index].item()
+#             #         print(env.current_mol.GetBondBetweenAtoms(u, v).GetBondType())
+#
+#             if action == 1:
+#                 path = 'mols/mol_add_idx_{}_arm_idx_{}.jpg'.format(add_idx, arm_idx)
+#                 # draw_mol(env.current_mol,path)
+#                 print(path)
+#                 print(env.current_graph.in_degrees())
+#                 print(torch.nonzero(env.current_graph.out_degrees()==1, as_tuple =True))
+#                 leaf = torch.nonzero(env.current_graph.out_degrees()==1, as_tuple =True)[0].unsqueeze(0).repeat(10,1)
+#                 print(leaf)
+#                 gr = env.current_graph.all_edges()[0][:10].unsqueeze(1).repeat(1,torch.nonzero(env.current_graph.out_degrees()==1, as_tuple =True)[0].shape[0])
+#                 print(gr)
+#                 print((gr==leaf).sum(dim=-1))
 
 if __name__ == '__main__':
+    env = Environement()
 
     mol = Chem.MolFromSmiles('NC(=O)c1ccccc1Nc1ccnc(Oc2ccccc2)c1')
     graph = mol_to_dgl(mol)
@@ -288,156 +361,46 @@ if __name__ == '__main__':
 
     env.current_graph = graph
     env.current_mol = mol
-    for i in range(50):
-        print(i)
-        add_avalaible_atom = torch.nonzero(env.current_graph.ndata['n_feat'][:, -1], as_tuple=True)[0]
-        del_avalaible_bond = torch.nonzero(env.current_graph.edata['e_feat'].argmax(dim=-1) == 0, as_tuple=True)[0]
+    env.reset()
+    for ep in range(20):
+        print(Chem.MolToSmiles(env.current_mol))
+        for i in range(10):
+            print(i)
+            print([Chem.MolToSmiles(m) for m in env.queue['mols']])
+            add_avalaible_atom = torch.nonzero(env.current_graph.ndata['n_feat'][:, -1], as_tuple=True)[0]
+            del_avalaible_bond = torch.nonzero(env.current_graph.edata['e_feat'].argmax(dim=-1) == 0, as_tuple=True)[0]
 
-        action_prob = [int(del_avalaible_bond.shape[0] > 0), int(add_avalaible_atom.shape[0] > 0)]
-        if sum(action_prob)==0 :
-            break
-        action = sample_idx(action_prob)
-        if action ==0 :
+            action_prob = [int(del_avalaible_bond.shape[0] > 0), int(add_avalaible_atom.shape[0] > 0)]
+            if sum(action_prob)==0 :
+                break
+            action = sample_idx(action_prob)
+            if action ==0 :
 
-            del_idx = del_avalaible_bond.tolist()[sample_idx(len(del_avalaible_bond.tolist())*[1])]
-            arm_idx = None
-            add_idx = None
-            print('check bond type')
-            # for index in del_avalaible_bond :
-            #     u = env.current_graph.all_edges()[0][index].item()
-            #     v = env.current_graph.all_edges()[1][index].item()
-            #     print(env.current_mol.GetBondBetweenAtoms(u,v).GetBondType())
-        elif action==1 :
-            arm_idx = sample_idx([i for i in range(1000)])
-            add_idx = add_avalaible_atom.tolist()[sample_idx(len(add_avalaible_atom.tolist())*[1])]
-            del_idx = None
+                del_idx = del_avalaible_bond.tolist()[sample_idx(len(del_avalaible_bond.tolist())*[1])]
+                arm_idx = None
+                add_idx = None
+                print('check bond type')
+                # for index in del_avalaible_bond :
+                #     u = env.current_graph.all_edges()[0][index].item()
+                #     v = env.current_graph.all_edges()[1][index].item()
+                #     print(env.current_mol.GetBondBetweenAtoms(u,v).GetBondType())
+            elif action==1 :
+                arm_idx = sample_idx([i for i in range(1000)])
+                add_idx = add_avalaible_atom.tolist()[sample_idx(len(add_avalaible_atom.tolist())*[1])]
+                del_idx = None
 
-        action_dict = {
-            'act' : action,
-            'del' : del_idx,
-            'arm' : arm_idx,
-            'add' : add_idx
-        }
-        _, not_changed = env.next_step(action_dict)
-
-        print('not changed ', not_changed)
-        if not_changed :
+            action_dict = {
+                'act' : action,
+                'del' : del_idx,
+                'arm' : arm_idx,
+                'add' : add_idx,
+                'global_act' : 0
+            }
+            _, not_changed, done = env.next_step(action_dict)
             print(action_dict)
-            print('nb atoms', len(env.current_mol.GetAtoms()))
-            # if action == 0 :
-            #     u = env.current_graph.all_edges()[0][del_idx].item()
-            #     v = env.current_graph.all_edges()[1][del_idx].item()
-            #     type_bond = str(env.current_mol.GetBondBetweenAtoms(u,v).GetBondType())
-            #     path = 'mols/'+type_bond +'_mol_del_{}_{}.jpg'.format(u,v)
-            #     draw_mol(env.current_mol,path)
-            #     print(path)
-            #     print(action_prob)
-            #     print(del_idx)
-            #     print(del_avalaible_bond)
-            #     for index in del_avalaible_bond:
-            #         u = env.current_graph.all_edges()[0][index].item()
-            #         v = env.current_graph.all_edges()[1][index].item()
-            #         print(env.current_mol.GetBondBetweenAtoms(u, v).GetBondType())
-
-            if action == 1:
-                path = 'mols/mol_add_idx_{}_arm_idx_{}.jpg'.format(add_idx, arm_idx)
-                # draw_mol(env.current_mol,path)
-                print(path)
-                print(env.current_graph.in_degrees())
-                print(torch.nonzero(env.current_graph.out_degrees()==1, as_tuple =True))
-                leaf = torch.nonzero(env.current_graph.out_degrees()==1, as_tuple =True)[0].unsqueeze(0).repeat(10,1)
-                print(leaf)
-                gr = env.current_graph.all_edges()[0][:10].unsqueeze(1).repeat(1,torch.nonzero(env.current_graph.out_degrees()==1, as_tuple =True)[0].shape[0])
-                print(gr)
-                print((gr==leaf).sum(dim=-1))
-    # env.edit(graph,mol,action= , del_idx=, add_idx=, arm_idx=)
+            print('not changed ', not_changed, Chem.MolToSmiles(env.current_mol))
 
 
-    # if __name__ == '__main__':
-    #     env = Environment_improve()
-    #     action = {
-    #         'act' : 0,
-    #         'del_idx' : 5,
-    #         'add_idx' : 3,
-    #         'arm_idx' : 6
-    #     }
-    #     mol, _ = env.init_mol()
-    #
-    #     print(env.compute_prop_score(mol))
-    #     print()
-    #     print(env.scaffold_mol_dict['smiles'][env.index_scaffold])
-    #     # print(env.indice_init_mol, env.init_mol_from_ref)
-#
-#     # with open('score.txt','w') as f:
-#     #     for i,smi in enumerate(env.ref_mol_dict['smiles']):
-#     #         text = smi
-#     #         mol = env.ref_mol_dict['mols'][i]
-#     #         gsk3 = get_scores('gsk3b',[mol])
-#     #         jnk3 = get_scores('jnk3', [mol])
-#     #         text += ','+str(gsk3)+','+str(jnk3)
-#     #         f.write(text+'\n')
-#     #
-#     # with open('MARS/data/actives_jnk3.txt', 'r') as f :
-#     #     data = f.readlines()
-#     # data = [smi[:-1] for smi in data[1:]]
-#     # score = []
-#     # smiles = []
-#     # mols = []
-#     # for d in data :
-#     #     smi, score_ = d.split(',')
-#     #     smiles.append(smi)
-#     #     score.append(score_)
-#     #     mols.append(Chem.MolFromSmiles(smi))
-#     # scores = np.array(get_scores('jnk3',mols))>=0.5
-#     # print(scores.mean())
-#
-#     done = False
-#     for t in range(100):
-#
-#         done = False
-#         env.reset()
-#         c = 0
-#         while done ==False  and c<10:
-#             c+=1
-#             graph = env.current_graph
-#             nb_edges = graph.all_edges()[0].shape[0]
-#             nb_nodes = graph.number_of_nodes()
-#
-#             act = sample_idx([0.5,0.5])
-#             del_idx = sample_idx(nb_edges*[1/nb_edges])
-#             p_add = np.array(nb_nodes*[1/nb_nodes])*(graph.ndata['n_feat'][:,-1]>0).numpy()
-#             add_idx = sample_idx(p_add.tolist())
-#             arm_idx = sample_idx(10*[1/10])
-#             action = {
-#                 'act' : 1,
-#                 'del' : del_idx,
-#                 'add' : add_idx,
-#                 'arm' : arm_idx
-#             }
-#             state, reward, done = env.next_step(action)
-#             print('imitation size ', len(env.imitation_dataset))
-#
-#     # ucb_ref = np.array(env.ref_mol_dict['UCB'])
-#     # print(ucb_ref[ucb_ref!=0])
-#     # print(np.array(env.ref_mol_dict['N'])[np.array(env.ref_mol_dict['N'])!=0],'N')
-#     # print(np.array(env.ref_mol_dict['R'])[np.array(env.ref_mol_dict['N'])!=0],'R')
-#     # print(np.array(env.ref_mol_dict['N']).sum()+np.array(env.new_mol_dict['N']).sum())
-#     # print(np.array(env.ref_mol_dict['R']).sum() + np.array(env.new_mol_dict['R']).sum())
-#     # print(len(env.new_mol_dict['mols']))
-#     # print(env.new_mol_dict['smiles'])
-#     # print(env.new_mol_dict['UCB'])
-#     # print(env.new_mol_dict)
-#
-#     new_mol = Chem.MolFromSmiles('O=[SH](=O)c1ccccc1Nc1nc(Nc2ccccc2)ncc1Cl')
-#     gsk3b_score = get_scores('gsk3b', [new_mol])[0]
-#     jnk3_score = get_scores('jnk3', [new_mol])[0]
-#     sa_score = get_score('sa', new_mol)
-#     qed_score = get_score('qed', new_mol)
-#     print(gsk3b_score)
-#     print(jnk3_score)
-#     print(sa_score)
-#     print(qed_score)
-#     print(min(gsk3b_score,0.6))
 
 
 

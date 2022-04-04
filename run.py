@@ -46,7 +46,7 @@ for i in range(1000):
 
     env.reset()
     done = False
-    state = env.current_graph
+    state = env.current_graph.to(config['device'])
     # print('episode_{}'.format(env.nb_episode))
     print('game_{}'.format(i))
     r = 0
